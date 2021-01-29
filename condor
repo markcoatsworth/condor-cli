@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+import getpass
 import htcondor
 import os
 import re
 import sys
+import stat
 
 from datetime import datetime, timedelta
 
@@ -49,6 +51,9 @@ def parse_args():
     parser.add_argument("command", nargs="*")
     # Options arguments: optional flagged arguments following the command args
     parser.add_argument("--resource", help="Type of compute resource")
+    parser.add_argument("--runtime", type=int, action="store", help="Runtime for provisioned Slurm glideins (seconds)")
+    parser.add_argument("--node_count", type=int, action="store", help="Number of Slurm nodes to provision")
+    parser.add_argument("--email", type=str, action="store", help="Email address for notifications")
     parser.add_argument("--schedd", help="Address to remote schedd to query")
 
     args = parser.parse_args()
@@ -57,14 +62,14 @@ def parse_args():
     try:
         command["object"] = command_object.lower()
     except:
-        print(f"ERROR: Object must be a string")
+        print(f"Error: Object must be a string")
         sys.exit(1)
 
     command_action = args.command[1]
     try:
         command["action"] = command_action.lower()
     except:
-        print(f"ERROR: Action must be a string")
+        print(f"Error: Action must be a string")
         sys.exit(1)
 
     if len(args.command) > 2:
@@ -72,6 +77,20 @@ def parse_args():
 
     if args.resource is not None:
         options["resource"] = args.resource.lower()
+
+    if args.runtime is not None:
+        try:
+            options["runtime"] = int(args.runtime)
+        except:
+            print(f"Error: The --runtime argument must take a numeric value")
+            sys.exit(1)
+    
+    if args.node_count is not None:
+        try:
+            options["node_count"] = int(args.node_count)
+        except:
+            print(f"Error: The --node_count argument must take a numeric value")
+            sys.exit(1)
 
     return {
         "command": command,
@@ -106,6 +125,74 @@ class DAGMan:
 
         return dag, out, log
 
+    @staticmethod
+    def write_slurm_dag(jobfile, runtime, node_count, email="user@domain.com"):
+
+        sendmail_sh = f"""#!/bin/sh
+
+#sendmail {email}
+"""
+
+        sendmail_sh_file = open("sendmail.sh", "w")
+        sendmail_sh_file.write(sendmail_sh)
+        sendmail_sh_file.close()
+        st = os.stat("sendmail.sh")
+        os.chmod("sendmail.sh", st.st_mode | stat.S_IEXEC)
+
+        slurm_config = "DAGMAN_USE_CONDOR_SUBMIT = False"
+        slurm_config_file = open("slurm_submit.config", "w")
+        slurm_config_file.write(slurm_config)
+        slurm_config_file.close()
+
+        slurm_dag = f"""JOB A {{
+    executable = sendmail.sh
+    universe = local
+    output = job-A-email.$(cluster).$(process).out
+    request_disk = 10M
+}}
+JOB B {{
+    annex_runtime = {runtime}
+    annex_node_count = {node_count}
+    annex_name = {getpass.getuser()}-test
+    annex_user = {getpass.getuser()}
+    universe=grid
+    grid_resource=batch slurm hpclogin1.chtc.wisc.edu
+    transfer_executable=false
+    executable=/home/jfrey/hobblein/hobblein_remote.sh
+    # args: <node count> <run time> <annex name> <user>
+    arguments=$(annex_node_count) $(annex_runtime) $(annex_name) $(annex_user)
+    +NodeNumber=$(annex_node_count)
+    #+HostNumber=$(annex_node_count)
+    +BatchRuntime=$(annex_runtime)
+    #+WholeNodes=true
+    output = job-B.$(Cluster).$(Process).out
+    error = job-B.$(Cluster).$(Process).err
+    log = annex.log
+    request_disk = 30
+    notification=NEVER
+}}
+JOB C {jobfile}
+JOB D {{
+    executable = sendmail.sh
+    universe = local
+    output = job-D-email.$(cluster).$(process).out
+    request_disk = 10M
+}}
+
+PARENT A CHILD B C
+PARENT B C CHILD D
+
+CONFIG slurm_submit.config
+
+VARS C Requirements="(Facility == \\\"CHTC_Slurm\\\")"
+VARS C +MayUseSlurm="True"
+VARS C +WantFlocking="True"
+"""
+
+        dag_file = open("slurm_submit.dag", "w")
+        dag_file.write(slurm_dag)
+        dag_file.close()
+
 
 class Job:
     """
@@ -115,24 +202,50 @@ class Job:
     @staticmethod
     def submit(file, options=None):
 
-        # If no resource specified, submit job to the local schedd
-        try:
-            submit_file = open(file)
-        except:
-            print(f"Could not read file: {file}")
-            sys.exit(1)
-        submit_data = submit_file.read()
-        submit_file.close()
+        if "resource" not in options:
 
-        submit_description = htcondor.Submit(submit_data)
-        with schedd.transaction() as txn:
+            # If no resource specified, submit job to the local schedd
             try:
-                cluster_id = submit_description.queue(txn, 1)
-                print(f"Job(s) submitted to cluster {cluster_id}")
-            except Exception as error:
-                print(f"Error submitting job: f{error.what()}")
+                submit_file = open(file)
+            except:
+                print(f"Could not read file: {file}")
+                sys.exit(1)
+            submit_data = submit_file.read()
+            submit_file.close()
+            
+            submit_description = htcondor.Submit(submit_data)
+            with schedd.transaction() as txn:
+                try:
+                    cluster_id = submit_description.queue(txn, 1)
+                    print(f"Job(s) submitted to cluster {cluster_id}")
+                except Exception as error:
+                    print(f"Error submitting job: f{error.what()}")
+                    sys.exit(1)
+
+        elif options["resource"] == "slurm":
+
+            if "runtime" not in options:
+                print("Error: Slurm resources must specify a --runtime argument")
+                sys.exit(1)
+            if "node_count" not in options:
+                print("Error: Slurm resources must specify a --node_count argument")
                 sys.exit(1)
 
+            # Delete any leftover files
+            # TODO: Find a safer way to do this, avoid deleting active .nodes.log files
+            os.system("rm -rf slurm_submit.dag*")
+
+            DAGMan.write_slurm_dag(file, options["runtime"], options["node_count"])
+            submit_description = htcondor.Submit.from_dag("slurm_submit.dag")
+            submit_description["+ResourceType"] = "\"Slurm\""
+
+            with schedd.transaction() as txn:
+                try:
+                    cluster_id = submit_description.queue(txn, 1)
+                    print(f"Job(s) submitted to cluster {cluster_id}")
+                except Exception as error:
+                    print(f"Error submitting job: f{error.what()}")
+                    sys.exit(1)
 
     @staticmethod
     def status(id, options=None):
@@ -141,39 +254,48 @@ class Job:
         """
 
         job = None
+        job_status = "IDLE"
+        resource_type = "htcondor"
 
-        # If no resource specified, assume job is running on local pool
-        if "resource" not in options:
-            try:
-                job = schedd.query(
-                    constraint=f"ClusterId == {id}",
-                    projection=["JobStartDate", "JobStatus", "LastVacateTime"]
-                )
-                print(f"Job is {JobStatus[job[0]['JobStatus']]}", end="")
-            except IndexError:
-                print(f"No jobs found for cluster ID {id}.")
-                sys.exit(0)
-            except:
-                print(f"Error looking up job status: {sys.exc_info()[0]}")
-                sys.exit(1)
+        try:
+            job = schedd.query(
+                constraint=f"ClusterId == {id}",
+                projection=["JobStartDate", "JobStatus", "LastVacateTime", "ResourceType"]
+            )
+        except IndexError:
+            print(f"No jobs found for cluster ID {id}.")
+            sys.exit(0)
+        except:
+            print(f"Error looking up job status: {sys.exc_info()[0]}")
+            sys.exit(1)
 
+        if len(job) == 0:
+            print(f"No jobs found for cluster ID {id}.")
+            sys.exit(0)
+            
+        if "ResourceType" in job[0]:
+            resource_type = job[0]["ResourceType"].lower()
+
+        # Now, produce job status based on the resource type
+        if resource_type == "htcondor":
             if JobStatus[job[0]['JobStatus']] is "RUNNING":
                 job_running_time = datetime.now() - datetime.fromtimestamp(job[0]["JobStartDate"])
-                print(f" since {round(job_running_time.seconds/3600)}h{round(job_running_time.seconds/60)}m{(job_running_time.seconds%60)}s")
+                print(f"Job is {JobStatus[job[0]['JobStatus']]} since {round(job_running_time.seconds/3600)}h{round(job_running_time.seconds/60)}m{(job_running_time.seconds%60)}s")
             elif JobStatus[job[0]['JobStatus']] is "HELD":
                 job_held_time = datetime.now() - datetime.fromtimestamp(job[0]["LastVacateTime"])
-                print(f" since {round(job_held_time.seconds/3600)}h{round(job_held_time.seconds/60)}m{(job_held_time.seconds%60)}s")
+                print(f"Job is {JobStatus[job[0]['JobStatus']]} since {round(job_held_time.seconds/3600)}h{round(job_held_time.seconds/60)}m{(job_held_time.seconds%60)}s")
             else:
-                print("")
+                print(f"Job is {JobStatus[job[0]['JobStatus']]}")
 
         # Jobs running on provisioned Slurm resources need to retrieve
         # additional information from the provisioning DAGMan log
-        elif options["resource"] == "slurm":
+        elif resource_type == "slurm":
 
             # Variables specific to jobs running on Slurm clusters
             jobs_running = 0
+            job_started_time = None
             provisioner_cluster_id = None
-            provisioner_job_started_time = None
+            provisioner_job_submitted_time = None
             slurm_cluster_id = None
             slurm_nodes_requested = None
             slurm_runtime = None
@@ -197,27 +319,27 @@ class Job:
             for event in dagman_events.events(0):
                 if "LogNotes" in event.keys() and event["LogNotes"] == "DAG Node: B":
                     provisioner_cluster_id = event.cluster
-                    provisioner_job_started_time = datetime.fromtimestamp(event.timestamp)
+                    provisioner_job_submitted_time = datetime.fromtimestamp(event.timestamp)
                     job_status = "PROVISIONING REQUEST PENDING"
-                if "LogNotes" in event.keys() and event["LogNotes"] == "DAG Node: C":
+                elif "LogNotes" in event.keys() and event["LogNotes"] == "DAG Node: C":
                     slurm_cluster_id = event.cluster
-                    if job_started_time is None:
-                        job_started_time = datetime.fromtimestamp(event.timestamp)
-                if event.cluster == slurm_cluster_id and event.type == htcondor.JobEventType.EXECUTE:
+                elif event.cluster == slurm_cluster_id and event.type == htcondor.JobEventType.EXECUTE:
                     job_status = "RUNNING"
                     jobs_running += 1
-                if event.cluster == slurm_cluster_id and event.type == htcondor.JobEventType.JOB_TERMINATED:
+                    if job_started_time is None:
+                        job_started_time = datetime.fromtimestamp(event.timestamp)
+                elif event.cluster == slurm_cluster_id and event.type == htcondor.JobEventType.JOB_TERMINATED:
                     jobs_running -= 1
                     if jobs_running == 0:
                         job_status = "COMPLETE"
-                if event.type == htcondor.JobEventType.JOB_HELD or event.type == htcondor.JobEventType.EXECUTABLE_ERROR:
+                elif event.type == htcondor.JobEventType.JOB_HELD or event.type == htcondor.JobEventType.EXECUTABLE_ERROR:
                     job_status = "ERROR"
 
             # Now that we have all the information we want, display it
             current_time = datetime.now()
             time_diff = None
             if job_status is "PROVISIONING REQUEST PENDING":
-                time_diff = current_time - provisioner_job_started_time
+                time_diff = current_time - provisioner_job_submitted_time
             elif job_status is "RUNNING":
                 time_diff = current_time - job_started_time
 
@@ -226,6 +348,10 @@ class Job:
                 print(f" since {round(time_diff.seconds/60)}m{(time_diff.seconds%60)}s")
             else:
                 print("")
+
+        else:
+            print("Error: The 'job status' command does not support {resource_type} resources.")
+            sys.exit(1)
 
 
     @staticmethod
@@ -241,14 +367,20 @@ class Job:
                     constraint=f"ClusterId == {id}",
                     projection=["RemoteHost"]
                 )
-                job_host = JobStatus[job[0]["RemoteHost"]]
-                print(f"Job is using resource {job_host}")
             except IndexError:
                 print(f"No jobs found for cluster ID {id}.")
                 sys.exit(0)
             except:
-                print(f"Error looking up job status: {sys.exc_info()[0]}")
+                print(f"Unable to look up job resources")
                 sys.exit(1)
+                
+            if len(job) == 0:
+                print(f"No jobs found for cluster ID {id}.")
+                sys.exit(0)
+            
+            # TODO: Make this work correctly for jobs that havne't started running yet 
+            job_host = job[0]["RemoteHost"]
+            print(f"Job is using resource {job_host}")
 
         # Jobs running on provisioned Slurm resources need to retrieve
         # additional information from the provisioning DAGMan log
@@ -260,7 +392,7 @@ class Job:
             slurm_cluster_id = None
         
             # User-facing variables (all values set below are default/initial state)
-            provisioner_job_started_time = None
+            provisioner_job_submitted_time = None
             provisioner_job_scheduled_end_time = None
             job_status = "NOT SUBMITTED"
             job_started_time = None
@@ -287,13 +419,15 @@ class Job:
             for event in dagman_events.events(0):
                 if "LogNotes" in event.keys() and event["LogNotes"] == "DAG Node: B":
                     provisioner_cluster_id = event.cluster
-                    provisioner_job_started_time = datetime.fromtimestamp(event.timestamp)
+                    provisioner_job_submitted_time = datetime.fromtimestamp(event.timestamp)
                     provisioner_job_scheduled_end_time = datetime.fromtimestamp(event.timestamp + slurm_runtime)
                     job_status = "PROVISIONING REQUEST PENDING"
+                if event.cluster == provisioner_cluster_id and event.type == htcondor.JobEventType.EXECUTE:
+                    provisioner_job_started_time = datetime.fromtimestamp(event.timestamp)
+                    provisioner_job_scheduled_end_time = datetime.fromtimestamp(event.timestamp + slurm_runtime)
                 if "LogNotes" in event.keys() and event["LogNotes"] == "DAG Node: C":
                     slurm_cluster_id = event.cluster
-                    if job_started_time is None:
-                        job_started_time = datetime.fromtimestamp(event.timestamp)
+                    job_started_time = datetime.fromtimestamp(event.timestamp)
                 if event.cluster == slurm_cluster_id and event.type == htcondor.JobEventType.EXECUTE:
                     job_status = "RUNNING"
                     jobs_running += 1
@@ -347,7 +481,7 @@ def main():
     if command["object"] == "job":
         if command["action"] == "submit":
             Job.submit(command["target"], options)
-        if command["action"] == "status":
+        elif command["action"] == "status":
             Job.status(command["target"], options)
         elif command["action"] == "resources":
             Job.resources(command["target"], options)
