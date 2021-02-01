@@ -208,16 +208,22 @@ class Job:
             try:
                 submit_file = open(file)
             except:
-                print(f"Could not read file: {file}")
+                print(f"Error: could not read file {file}")
                 sys.exit(1)
             submit_data = submit_file.read()
             submit_file.close()
-            
             submit_description = htcondor.Submit(submit_data)
+
+            # The Job class can only submit a single job at a time
+            submit_qargs = submit_description.getQArgs()
+            if submit_qargs != "" and submit_qargs != "1":
+                print("Error: can only submit one job at a time. See the job-set syntax for submitting multiple jobs.")
+                sys.exit(1)
+
             with schedd.transaction() as txn:
                 try:
                     cluster_id = submit_description.queue(txn, 1)
-                    print(f"Job(s) submitted to cluster {cluster_id}")
+                    print(f"Job {cluster_id} was submitted.")
                 except Exception as error:
                     print(f"Error submitting job: f{error.what()}")
                     sys.exit(1)
@@ -238,11 +244,17 @@ class Job:
             DAGMan.write_slurm_dag(file, options["runtime"], options["node_count"])
             submit_description = htcondor.Submit.from_dag("slurm_submit.dag")
             submit_description["+ResourceType"] = "\"Slurm\""
+            
+            # The Job class can only submit a single job at a time
+            submit_qargs = submit_description.getQArgs()
+            if submit_qargs != "" and submit_qargs != "1":
+                print("Error: can only submit one job at a time. See the job-set syntax for submitting multiple jobs.")
+                sys.exit(1)
 
             with schedd.transaction() as txn:
                 try:
                     cluster_id = submit_description.queue(txn, 1)
-                    print(f"Job(s) submitted to cluster {cluster_id}")
+                    print(f"Job {cluster_id} was submitted.")
                 except Exception as error:
                     print(f"Error submitting job: f{error.what()}")
                     sys.exit(1)
@@ -263,14 +275,14 @@ class Job:
                 projection=["JobStartDate", "JobStatus", "LastVacateTime", "ResourceType"]
             )
         except IndexError:
-            print(f"No jobs found for cluster ID {id}.")
+            print(f"No job found for ID {id}.")
             sys.exit(0)
         except:
             print(f"Error looking up job status: {sys.exc_info()[0]}")
             sys.exit(1)
 
         if len(job) == 0:
-            print(f"No jobs found for cluster ID {id}.")
+            print(f"No job found for ID {id}.")
             sys.exit(0)
             
         if "ResourceType" in job[0]:
@@ -303,7 +315,7 @@ class Job:
             dagman_dag, dagman_out, dagman_log = DAGMan.get_files(id)
 
             if dagman_dag is None:
-                print(f"No Slurm jobs found for cluster ID {id}.")
+                print(f"No Slurm job found for ID {id}.")
                 sys.exit(0)
 
             # Parse the .dag file to retrieve some user input values
@@ -368,14 +380,14 @@ class Job:
                     projection=["RemoteHost"]
                 )
             except IndexError:
-                print(f"No jobs found for cluster ID {id}.")
+                print(f"No jobs found for ID {id}.")
                 sys.exit(0)
             except:
                 print(f"Unable to look up job resources")
                 sys.exit(1)
                 
             if len(job) == 0:
-                print(f"No jobs found for cluster ID {id}.")
+                print(f"No jobs found for ID {id}.")
                 sys.exit(0)
             
             # TODO: Make this work correctly for jobs that havne't started running yet 
@@ -403,7 +415,7 @@ class Job:
             dagman_dag, dagman_out, dagman_log = DAGMan.get_files(id)
 
             if dagman_dag is None:
-                print(f"No Slurm jobs found for cluster ID {id}.")
+                print(f"No Slurm job found for ID {id}.")
                 sys.exit(0)
 
             # Parse the .dag file to retrieve some user input values
