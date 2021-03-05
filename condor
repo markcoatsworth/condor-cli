@@ -193,6 +193,56 @@ VARS C +WantFlocking="True"
         dag_file.write(slurm_dag)
         dag_file.close()
 
+    @staticmethod
+    def write_ec2_dag(jobfile, runtime, node_count, email="user@domain.com"):
+
+        sendmail_sh = f"""#!/bin/sh
+
+#sendmail {email}
+"""
+
+        sendmail_sh_file = open("sendmail.sh", "w")
+        sendmail_sh_file.write(sendmail_sh)
+        sendmail_sh_file.close()
+        st = os.stat("sendmail.sh")
+        os.chmod("sendmail.sh", st.st_mode | stat.S_IEXEC)
+
+        ec2_config = "DAGMAN_USE_CONDOR_SUBMIT = False"
+        ec2_config_file = open("ec2_submit.config", "w")
+        ec2_config_file.write(ec2_config)
+        ec2_config_file.close()
+
+        ec2_dag = f"""JOB A {{
+    executable = sendmail.sh
+    universe = local
+    output = job-A-email.$(cluster).$(process).out
+    request_disk = 10M
+}}
+JOB B {{
+    executable = condor_annex
+    arguments = -count {node_count} -duration {runtime} -annex-name EC2Annex
+    output = job-B-ec2_annex.$(Cluster).$(Process).out
+    error = job-B-ec2_annex.$(Cluster).$(Process).err
+    log = ec2_annex.log
+}}
+JOB C {jobfile}
+JOB D {{
+    executable = sendmail.sh
+    universe = local
+    output = job-D-email.$(cluster).$(process).out
+    request_disk = 10M
+}}
+
+PARENT A CHILD B C
+PARENT B C CHILD D
+
+CONFIG ec2_submit.config
+"""
+
+        dag_file = open("ec2_submit.dag", "w")
+        dag_file.write(ec2_dag)
+        dag_file.close()
+
 
 class Job:
     """
@@ -258,6 +308,38 @@ class Job:
                 except Exception as error:
                     print(f"Error submitting job: f{error.what()}")
                     sys.exit(1)
+
+        elif options["resource"] == "ec2":
+
+            if "runtime" not in options:
+                print("Error: EC2 resources must specify a --runtime argument")
+                sys.exit(1)
+            if "node_count" not in options:
+                print("Error: EC2 resources must specify a --node_count argument")
+                sys.exit(1)
+
+            # Delete any leftover files
+            # TODO: Find a safer way to do this, avoid deleting active .nodes.log files
+            os.system("rm -rf ec2_submit.dag*")
+
+            DAGMan.write_ec2_dag(file, options["runtime"], options["node_count"])
+            submit_description = htcondor.Submit.from_dag("ec2_submit.dag")
+            submit_description["+ResourceType"] = "\"EC2\""
+
+            # The Job class can only submit a single job at a time
+            submit_qargs = submit_description.getQArgs()
+            if submit_qargs != "" and submit_qargs != "1":
+                print("Error: can only submit one job at a time. See the job-set syntax for submitting multiple jobs.")
+                sys.exit(1)
+
+            with schedd.transaction() as txn:
+                try:
+                    cluster_id = submit_description.queue(txn, 1)
+                    print(f"Job {cluster_id} was submitted.")
+                except Exception as error:
+                    print(f"Error submitting job: f{error.what()}")
+                    sys.exit(1)
+
 
     @staticmethod
     def status(id, options=None):
